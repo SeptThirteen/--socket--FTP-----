@@ -1,8 +1,12 @@
 package data;
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Locale;
 
 /**
@@ -37,6 +41,9 @@ public class ClientSession implements Runnable {
     /** 用户表管理器 */
     private final UserStore userStore;
     
+    /** 路径验证器 */
+    private final PathValidator pathValidator;
+
     // ==================== 会话状态 ====================
     
     /** 是否已认证（已登录）*/
@@ -45,19 +52,34 @@ public class ClientSession implements Runnable {
     /** 当前登录的用户名（未登录时为 null）*/
     private String currentUser = null;
     
+    /** 当前工作目录（相对于根目录的路径，如 "/" 或 "/upload"） */
+    private String currentWorkingDir = "/";
+    
+    /** 客户端数据端口地址（由 PORT 命令设置）*/
+    private InetSocketAddress dataAddress = null;
+
+
     // ==================== 构造方法 ====================
     
     /**
      * 初始化一个会话
      * 
      * @param controlSocket 与客户端连接的 Socket
+     * @param rootPath FTP 虚拟根目录路径
      * @param userStore 用户表管理器
      * @throws IOException 如果 Socket 读写出错
      */
-    public ClientSession(Socket controlSocket, UserStore userStore) throws IOException {
+    public ClientSession(Socket controlSocket, String rootPath, UserStore userStore) throws IOException {
         this.controlSocket = controlSocket;
         this.userStore = userStore;
+        // 初始化路径验证器
+        this.pathValidator = new PathValidator(rootPath);
         
+        // 初始化当前工作目录为根目录
+        this.currentWorkingDir = "/";
+            
+
+
         // 从 Socket 获取输入流和输出流
         // InputStreamReader 将字节流转换为字符流，因为 FTP 命令是文本协议，需要把字节流转换成字符流并用带缓冲的按行读写工具来正确、可靠且高效地处理命令和回复。
         // BufferedReader 提供按行读取的便利
@@ -155,6 +177,26 @@ public class ClientSession implements Runnable {
                 case "HELP":
                     handleHelp();
                     break;
+                case "CWD":
+                    handleCwd(arg);
+                    break;
+                case "PWD":
+                    handlePwd();
+                    break;
+                case "PORT":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handlePort(arg);
+                    }
+                    break;
+                case "LIST":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleList();
+                    }
+                    break;
                 default:
                     // 未知命令
                     reply(500, "Unknown command: " + cmd);
@@ -246,7 +288,61 @@ public class ClientSession implements Runnable {
         // 关闭连接，主循环中 readLine() 会返回 null，自动退出
         controlSocket.close();
     }
+
+    /**
+     * 处理 CWD 命令
+     * 客户端要求：CWD <目录>
+     * 服务器响应：
+     *   - 成功 → 250（目录已更改）
+     *   - 失败 → 550（目录不可用）
+     */
+    private void handleCwd(String dir) throws IOException {
+        if (!authenticated) {
+            reply(530, "请先登录");
+            return;
+        }
+        
+        if (dir == null || dir.trim().isEmpty()) {
+            reply(501, "CWD 命令需要一个参数");
+            return;
+        }
+        
+        dir = dir.trim();
+        
+        try {
+            //* 获取当前目录的绝对路径 */
+            Path newPath = pathValidator.resolvePath(currentWorkingDir, dir);
+            //* 验证该路径是否为有效目录 */
+            if (pathValidator.isValidDirectory(newPath)) {
+                // 更新当前工作目录（相对于根目录的路径）
+                currentWorkingDir = pathValidator.toVirtualPath(newPath);
+                reply(250, "目录已更改到 " + currentWorkingDir);
+            } else {
+                reply(550, "目录不可用");
+            }
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝");
+        } catch (IOException e) {
+            reply(550, "目录不可用");
+        }
+    }
     
+    /**
+     * 处理 PWD 命令
+     * 客户端要求：PWD
+     * 服务器响应：257 "<当前目录>"
+     */
+    private void handlePwd() throws IOException {
+        if (!authenticated) {
+            reply(530, "请先登录");
+            return;
+        }
+        
+        reply(257, "\"" + currentWorkingDir + "\" 是当前目录");
+    }    
+
+
+
     /**
      * 处理 HELP 命令（可选）
      * 显示支持的命令列表
@@ -255,11 +351,156 @@ public class ClientSession implements Runnable {
         reply(214, "支持的命令:");
         out.write("  user <用户名>  - 使用用户名登录\r\n");
         out.write("  pass <密码>  - 提供密码\r\n");
-        out.write("  quit             - 断开连接\r\n");
-        out.write("  help             - 显示此消息\r\n");
+        out.write("  port h1,h2,h3,h4,p1,p2 - 设置数据端口\r\n");
+        out.write("  list - 列出目录内容\r\n");
+        out.write("  quit - 断开连接\r\n");
+        out.write("  cwd <目录>  - 更改当前目录\r\n");
+        out.write("  pwd - 显示当前目录\r\n");
+        out.write("  help - 显示此消息\r\n");
         out.flush();
     }
     
+    /**
+     * 处理 PORT 命令 - 设置客户端数据端口
+     * 
+     * 命令格式：PORT h1,h2,h3,h4,p1,p2
+     * 
+     * @param arg 格式为 "h1,h2,h3,h4,p1,p2" 的字符串
+     */
+    private void handlePort(String arg) throws IOException {
+        // 1. 参数校验
+        if (arg == null || arg.trim().isEmpty()) {
+            reply(501, "PORT 命令需要参数");
+            return;
+        }
+        
+        arg = arg.trim();
+        
+        try {
+            // 2. 解析参数
+            String[] parts = arg.split(",");
+            
+            if (parts.length != 6) {
+                reply(501, "PORT 命令格式: h1,h2,h3,h4,p1,p2");
+                return;
+            }
+            
+            // 3. 组装 IP 地址
+            String ip = parts[0] + "." + parts[1] + "." + parts[2] + "." + parts[3];
+            
+            // 4. 计算端口：port = p1 * 256 + p2
+            int p1 = Integer.parseInt(parts[4]);
+            int p2 = Integer.parseInt(parts[5]);
+            int port = p1 * 256 + p2;
+            
+            // 5. 端口范围校验
+            if (port < 1024 || port > 65535) {
+                reply(501, "无效的端口号: " + port);
+                return;
+            }
+            
+            // 6. 保存数据端口地址
+            dataAddress = new InetSocketAddress(ip, port);
+            
+            System.out.println("[ClientSession] 客户端数据端口设置为: " + dataAddress);
+            reply(200, "PORT 命令执行成功");
+            
+        } catch (NumberFormatException e) {
+            reply(501, "PORT 命令参数无效: " + e.getMessage());
+        } catch (Exception e) {
+            reply(501, "PORT 命令执行失败: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * 处理 LIST 命令 - 列出当前目录内容
+     * 
+     * 工作流程：
+     * 1. 检查是否已设置数据端口（PORT 命令）
+     * 2. 发送 150 响应（即将打开数据连接）
+     * 3. 建立数据连接
+     * 4. 读取当前目录的文件列表
+     * 5. 通过数据连接发送列表
+     * 6. 关闭数据连接
+     * 7. 发送 226 响应（传输完成）
+     */
+    private void handleList() throws IOException {
+        // 1. 检查是否已设置数据端口
+        if (dataAddress == null) {
+            reply(425, "请先使用 PORT 命令");
+            return;
+        }
+        
+        // 2. 解析当前工作目录对应的实际路径
+        Path currentDir;
+        try {
+            currentDir = pathValidator.resolvePath(currentWorkingDir, ".");
+        } catch (Exception e) {
+            reply(550, "无法访问目录: " + e.getMessage());
+            return;
+        }
+        
+        // 3. 检查目录是否存在
+        if (!Files.exists(currentDir) || !Files.isDirectory(currentDir)) {
+            reply(550, "目录不存在");
+            return;
+        }
+        
+        // 4. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开 ASCII 模式数据连接以获取文件列表");
+        
+        // 5. 建立数据连接并传输目录列表
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 连接到客户端数据端口
+            dataConn.connect(dataAddress);
+            
+            // 构建目录列表文本
+            StringBuilder listBuilder = new StringBuilder();
+            
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(currentDir)) {
+                for (Path entry : stream) {
+                    // 获取文件名
+                    String filename = entry.getFileName().toString();
+                    
+                    // 判断是否为目录
+                    if (Files.isDirectory(entry)) {
+                        // 目录名后加 / 标识
+                        listBuilder.append(filename).append("/\r\n");
+                    } else {
+                        // 普通文件，也可以显示大小
+                        long size = Files.size(entry);
+                        listBuilder.append(filename).append(" (").append(size).append(" 字节)\r\n");
+                    }
+                }
+            }
+            
+            // 如果目录为空
+            if (listBuilder.length() == 0) {
+                listBuilder.append("(空目录)\r\n");
+            }
+            
+            // 发送列表数据
+            String listText = listBuilder.toString();
+            dataConn.sendText(listText);
+            
+            System.out.println("[ClientSession] 已发送目录列表，共 " + listText.length() + " 字节");
+            
+        } catch (IOException e) {
+            // 数据连接失败
+            reply(426, "数据连接失败: " + e.getMessage());
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            // 清空数据地址（要求下次使用前重新设置 PORT）
+            dataAddress = null;
+        }
+        
+        // 6. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
     
     // ==================== 工具方法 ====================
     /**
