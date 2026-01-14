@@ -20,7 +20,7 @@ public class SimpleFtpClient {
     public static void main(String[] args) {
         SimpleFtpClient client = new SimpleFtpClient();
         try {
-            System.out.println("========== FTP 客户端测试开始 ==========\n");
+            System.out.println("========== FTP 客户端完整功能测试开始 ==========\n");
             
             client.connect("127.0.0.1", 2121);
             client.login("alice", "123456");
@@ -34,18 +34,36 @@ public class SimpleFtpClient {
             client.pwd();
             client.list();
             
-            System.out.println("\n[测试 3] 切换回上级目录");
+            System.out.println("\n[测试 3] 下载文件 (RETR)");
+            // 假设在 public 目录下有 test.txt 文件
+            client.retr("test.txt", "downloads/test_downloaded.txt");
+            
+            System.out.println("\n[测试 4] 切换回上级目录");
             client.cwd("..");
             client.pwd();
-            client.list();
             
-            System.out.println("\n[测试 4] 切换到 upload 目录");
+            System.out.println("\n[测试 5] 切换到 upload 目录");
             client.cwd("upload");
             client.pwd();
             client.list();
             
+            System.out.println("\n[测试 6] 上传文件 (STOR)");
+            // 假设在 uploads 目录下有 local_test.txt 文件
+            client.stor("uploads/local_test.txt", "remote_test.txt");
+            
+            System.out.println("\n[测试 7] 列出更新后的 upload 目录");
+            client.list();
+            
+            System.out.println("\n[测试 8] 删除文件 (DELE)");
+            client.dele("remote_test.txt");
+            
+            System.out.println("\n[测试 9] 列出最终目录状态");
+            client.list();
+            
             System.out.println("\n[测试完成] 断开连接");
             client.quit();
+            
+            System.out.println("\n========== 所有测试完成 ==========\n");
             
         } catch (Exception e) {
             System.err.println("[致命错误] " + e.getMessage());
@@ -201,6 +219,236 @@ public class SimpleFtpClient {
                     // 忽略
                 }
             }
+        }
+    }
+    
+    /**
+     * 下载文件（RETR 命令）
+     */
+    public void retr(String remoteFilename, String localSavePath) throws IOException {
+        ServerSocket tempServerSocket = null;
+        Socket dataSocket = null;
+        
+        try {
+            // 1. 创建 ServerSocket 监听本地端口
+            tempServerSocket = new ServerSocket(0);
+            int dataPort = tempServerSocket.getLocalPort();
+            
+            System.out.println("\n[RETR 下载命令流程]");
+            System.out.println("[客户端] 本地数据端口: " + dataPort);
+            
+            // 2. 计算 PORT 命令的参数
+            int p1 = dataPort / 256;
+            int p2 = dataPort % 256;
+            
+            // 3. 发送 PORT 命令
+            String portCmd = "PORT 127,0,0,1," + p1 + "," + p2;
+            System.out.println("[客户端] 发送: " + portCmd);
+            
+            out.write(portCmd + "\r\n");
+            out.flush();
+            
+            String portResponse = in.readLine();
+            System.out.println("[服务器] " + portResponse);
+            
+            if (!portResponse.startsWith("200")) {
+                System.err.println("[错误] PORT 命令失败");
+                return;
+            }
+            
+            // 4. 发送 RETR 命令
+            String retrCmd = "RETR " + remoteFilename;
+            System.out.println("[客户端] 发送: " + retrCmd);
+            out.write(retrCmd + "\r\n");
+            out.flush();
+            
+            // 5. 读取 150 响应
+            String response150 = in.readLine();
+            System.out.println("[服务器] " + response150);
+            
+            if (!response150.startsWith("150")) {
+                System.err.println("[错误] RETR 命令失败: " + response150);
+                String errorResponse = in.readLine();
+                System.out.println("[服务器] " + errorResponse);
+                return;
+            }
+            
+            // 6. 等待服务器的数据连接
+            System.out.println("[客户端] 等待服务器的数据连接...");
+            tempServerSocket.setSoTimeout(10000);
+            
+            dataSocket = tempServerSocket.accept();
+            System.out.println("[客户端] ✓ 数据连接已建立");
+            
+            // 7. 接收文件数据
+            InputStream dataIn = dataSocket.getInputStream();
+            FileOutputStream fileOut = new FileOutputStream(localSavePath);
+            
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            long totalBytes = 0;
+            
+            System.out.println("[客户端] 接收文件数据...");
+            while ((bytesRead = dataIn.read(buffer)) != -1) {
+                fileOut.write(buffer, 0, bytesRead);
+                totalBytes += bytesRead;
+            }
+            
+            fileOut.close();
+            dataSocket.close();
+            
+            System.out.println("[客户端] ✓ 文件接收完成 (" + totalBytes + " 字节)");
+            System.out.println("[客户端] 保存位置: " + localSavePath);
+            
+            // 8. 读取 226 响应
+            String response226 = in.readLine();
+            System.out.println("[服务器] " + response226);
+            
+        } catch (IOException e) {
+            System.err.println("[错误] 下载失败: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            if (dataSocket != null) {
+                try {
+                    dataSocket.close();
+                } catch (IOException e) {
+                    // 忽略
+                }
+            }
+            
+            if (tempServerSocket != null && !tempServerSocket.isClosed()) {
+                try {
+                    tempServerSocket.close();
+                } catch (IOException e) {
+                    // 忽略
+                }
+            }
+        }
+    }
+    
+    /**
+     * 上传文件（STOR 命令）
+     */
+    public void stor(String localFilePath, String remoteFilename) throws IOException {
+        ServerSocket tempServerSocket = null;
+        Socket dataSocket = null;
+        
+        try {
+            // 1. 创建 ServerSocket 监听本地端口
+            tempServerSocket = new ServerSocket(0);
+            int dataPort = tempServerSocket.getLocalPort();
+            
+            System.out.println("\n[STOR 上传命令流程]");
+            System.out.println("[客户端] 本地数据端口: " + dataPort);
+            
+            // 2. 计算 PORT 命令的参数
+            int p1 = dataPort / 256;
+            int p2 = dataPort % 256;
+            
+            // 3. 发送 PORT 命令
+            String portCmd = "PORT 127,0,0,1," + p1 + "," + p2;
+            System.out.println("[客户端] 发送: " + portCmd);
+            
+            out.write(portCmd + "\r\n");
+            out.flush();
+            
+            String portResponse = in.readLine();
+            System.out.println("[服务器] " + portResponse);
+            
+            if (!portResponse.startsWith("200")) {
+                System.err.println("[错误] PORT 命令失败");
+                return;
+            }
+            
+            // 4. 发送 STOR 命令
+            String storCmd = "STOR " + remoteFilename;
+            System.out.println("[客户端] 发送: " + storCmd);
+            out.write(storCmd + "\r\n");
+            out.flush();
+            
+            // 5. 读取 150 响应
+            String response150 = in.readLine();
+            System.out.println("[服务器] " + response150);
+            
+            if (!response150.startsWith("150")) {
+                System.err.println("[错误] STOR 命令失败: " + response150);
+                String errorResponse = in.readLine();
+                System.out.println("[服务器] " + errorResponse);
+                return;
+            }
+            
+            // 6. 等待服务器的数据连接
+            System.out.println("[客户端] 等待服务器的数据连接...");
+            tempServerSocket.setSoTimeout(10000);
+            
+            dataSocket = tempServerSocket.accept();
+            System.out.println("[客户端] ✓ 数据连接已建立");
+            
+            // 7. 发送文件数据
+            FileInputStream fileIn = new FileInputStream(localFilePath);
+            OutputStream dataOut = dataSocket.getOutputStream();
+            
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            long totalBytes = 0;
+            
+            System.out.println("[客户端] 发送文件数据...");
+            while ((bytesRead = fileIn.read(buffer)) != -1) {
+                dataOut.write(buffer, 0, bytesRead);
+                totalBytes += bytesRead;
+            }
+            
+            dataOut.flush();
+            fileIn.close();
+            dataSocket.close();
+            
+            System.out.println("[客户端] ✓ 文件发送完成 (" + totalBytes + " 字节)");
+            
+            // 8. 读取 226 响应
+            String response226 = in.readLine();
+            System.out.println("[服务器] " + response226);
+            
+        } catch (IOException e) {
+            System.err.println("[错误] 上传失败: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            if (dataSocket != null) {
+                try {
+                    dataSocket.close();
+                } catch (IOException e) {
+                    // 忽略
+                }
+            }
+            
+            if (tempServerSocket != null && !tempServerSocket.isClosed()) {
+                try {
+                    tempServerSocket.close();
+                } catch (IOException e) {
+                    // 忽略
+                }
+            }
+        }
+    }
+    
+    /**
+     * 删除文件（DELE 命令）
+     */
+    public void dele(String remoteFilename) throws IOException {
+        System.out.println("\n[DELE 删除命令]");
+        System.out.println("[客户端] 发送: DELE " + remoteFilename);
+        
+        out.write("DELE " + remoteFilename + "\r\n");
+        out.flush();
+        
+        String response = in.readLine();
+        System.out.println("[服务器] " + response);
+        
+        if (response.startsWith("250")) {
+            System.out.println("[客户端] ✓ 文件删除成功");
+        } else if (response.startsWith("550")) {
+            System.out.println("[客户端] ✗ 文件不存在或无法删除");
+        } else {
+            System.out.println("[客户端] ✗ 删除失败: " + response);
         }
     }
     

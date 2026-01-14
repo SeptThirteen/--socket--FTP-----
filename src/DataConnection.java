@@ -100,6 +100,64 @@ public class DataConnection {
     }
     
     /**
+     * 从输入流读取数据并发送（流式传输）
+     * 用于文件下载，避免将整个文件加载到内存
+     * 
+     * @param inputStream 源输入流（如文件输入流）
+     * @return 传输的总字节数
+     * @throws IOException 如果传输失败
+     */
+    public long sendFromStream(InputStream inputStream) throws IOException {
+        if (outputStream == null) {
+            throw new IOException("Data connection not established");
+        }
+        
+        byte[] buffer = new byte[8192];  // 8KB 缓冲区
+        int bytesRead;
+        long totalBytes = 0;
+        
+        // 循环读取并发送
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+            outputStream.write(buffer, 0, bytesRead);
+            totalBytes += bytesRead;
+        }
+        
+        outputStream.flush();
+        
+        System.out.println("[DataConnection] 已传输 " + totalBytes + " 字节");
+        return totalBytes;
+    }
+
+    /**
+     * 接收数据并写入输出流（流式接收）
+     * 用于文件上传，避免将整个文件加载到内存
+     * 
+     * @param outputStream 目标输出流（如文件输出流）
+     * @return 接收的总字节数
+     * @throws IOException 如果接收失败
+     */
+    public long receiveToStream(OutputStream outputStream) throws IOException {
+        if (inputStream == null) {
+            throw new IOException("Data connection not established");
+        }
+        
+        byte[] buffer = new byte[8192];  // 8KB 缓冲区
+        int bytesRead;
+        long totalBytes = 0;
+        
+        // 循环接收并写入
+        while ((bytesRead = inputStream.read(buffer)) != -1) {
+            outputStream.write(buffer, 0, bytesRead);
+            totalBytes += bytesRead;
+        }
+        
+        outputStream.flush();
+        
+        System.out.println("[DataConnection] 已接收 " + totalBytes + " 字节");
+        return totalBytes;
+    }
+    
+    /**
      * 关闭数据连接
      * 
      * 数据传输完成后必须关闭，释放资源

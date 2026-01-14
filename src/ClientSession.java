@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Locale;
 
 /**
@@ -197,9 +198,48 @@ public class ClientSession implements Runnable {
                         handleList();
                     }
                     break;
+                case "RETR":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleRetr(arg);
+                    }
+                    break;
+                case "STOR":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleStor(arg);
+                    }
+                    break;
+                case "DELE":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleDele(arg);
+                    }
+                    break;
+                case "TYPE":
+                    // TYPE 命令：设置传输模式（ASCII/BINARY）
+                    // 我们统一使用二进制，但需要响应此命令以兼容 Windows 资源管理器
+                    handleType(arg);
+                    break;
+                case "OPTS":
+                    // OPTS 命令：FTP 扩展选项
+                    // 返回 502 或 200 均可，这里返回 200 表示接受但不处理
+                    reply(200, "命令接受");
+                    break;
+                case "SYST":
+                    // SYST 命令：查询系统类型
+                    reply(215, "WINDOWS");
+                    break;
+                case "NOOP":
+                    // NOOP 命令：空操作（心跳）
+                    reply(200, "NOOP 命令");
+                    break;
                 default:
                     // 未知命令
-                    reply(500, "Unknown command: " + cmd);
+                    reply(502, "不支持的命令: " + cmd);
             }
         } catch (Exception e) {
             // 命令处理中出错，发送错误响应
@@ -353,11 +393,39 @@ public class ClientSession implements Runnable {
         out.write("  pass <密码>  - 提供密码\r\n");
         out.write("  port h1,h2,h3,h4,p1,p2 - 设置数据端口\r\n");
         out.write("  list - 列出目录内容\r\n");
+        out.write("  retr <文件名> - 下载文件\r\n");
+        out.write("  stor <文件名> - 上传文件\r\n");
+        out.write("  dele <文件名> - 删除文件\r\n");
         out.write("  quit - 断开连接\r\n");
         out.write("  cwd <目录>  - 更改当前目录\r\n");
         out.write("  pwd - 显示当前目录\r\n");
         out.write("  help - 显示此消息\r\n");
         out.flush();
+    }
+
+    /**
+     * 处理 TYPE 命令 - 设置传输模式
+     * 
+     * 命令格式：TYPE A (ASCII) 或 TYPE I (Binary)
+     * 本服务器统一使用二进制模式，但需要接受此命令以兼容 Windows 资源管理器
+     */
+    private void handleType(String mode) throws IOException {
+        if (mode == null || mode.trim().isEmpty()) {
+            reply(501, "TYPE 命令需要参数（A 或 I）");
+            return;
+        }
+        
+        mode = mode.trim().toUpperCase();
+        
+        if ("A".equals(mode)) {
+            // ASCII 模式
+            reply(200, "设置为 ASCII 模式");
+        } else if ("I".equals(mode)) {
+            // Binary 模式
+            reply(200, "设置为二进制模式");
+        } else {
+            reply(501, "TYPE 命令参数错误，应为 A 或 I");
+        }
     }
     
     /**
@@ -499,6 +567,251 @@ public class ClientSession implements Runnable {
         
         // 6. 发送传输完成响应
         reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 RETR 命令 - 下载文件
+     * 
+     * 命令格式：RETR <filename>
+     */
+    private void handleRetr(String filename) throws IOException {
+        // 1. 检查是否已设置数据端口
+        if (dataAddress == null) {
+            reply(425, "请先使用 PORT 命令");
+            return;
+        }
+        
+        // 2. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "RETR 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 3. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(550, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 4. 检查文件是否存在
+        if (!Files.exists(filePath)) {
+            reply(550, "文件不存在: " + filename);
+            return;
+        }
+        
+        // 5. 检查是否为普通文件（不是目录）
+        if (!Files.isRegularFile(filePath)) {
+            reply(550, filename + " 不是普通文件");
+            return;
+        }
+        
+        // 6. 检查文件是否可读
+        if (!Files.isReadable(filePath)) {
+            reply(550, "文件不可读: " + filename);
+            return;
+        }
+        
+        // 7. 获取文件大小（用于日志）
+        long fileSize = Files.size(filePath);
+        
+        // 8. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开二进制模式数据连接以传输 " + filename + " (" + fileSize + " 字节)");
+        
+        // 9. 建立数据连接并传输文件
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 连接到客户端数据端口
+            dataConn.connect(dataAddress);
+            
+            // 打开文件输入流
+            try (InputStream fileInput = Files.newInputStream(filePath)) {
+                // 流式传输文件内容
+                long bytesTransferred = dataConn.sendFromStream(fileInput);
+                
+                System.out.println("[ClientSession] 文件 " + filename + " 传输完成: " + 
+                                 bytesTransferred + " 字节");
+            }
+            
+        } catch (IOException e) {
+            // 数据连接失败
+            reply(426, "数据连接失败: " + e.getMessage());
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            // 清空数据地址（要求下次使用前重新设置 PORT）
+            dataAddress = null;
+        }
+        
+        // 10. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 STOR 命令 - 上传文件
+     * 
+     * 命令格式：STOR <filename>
+     */
+    private void handleStor(String filename) throws IOException {
+        // 1. 检查是否已设置数据端口
+        if (dataAddress == null) {
+            reply(425, "请先使用 PORT 命令");
+            return;
+        }
+        
+        // 2. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "STOR 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 3. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(550, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 4. 检查父目录是否存在且可写
+        Path parentDir = filePath.getParent();
+        if (parentDir == null) {
+            reply(550, "无法确定父目录");
+            return;
+        }
+        
+        if (!Files.exists(parentDir)) {
+            reply(550, "目标目录不存在");
+            return;
+        }
+        
+        if (!Files.isDirectory(parentDir)) {
+            reply(550, "父路径不是目录");
+            return;
+        }
+        
+        if (!Files.isWritable(parentDir)) {
+            reply(550, "目标目录不可写");
+            return;
+        }
+        
+        // 5. 检查文件是否已存在（覆盖策略：直接覆盖）
+        boolean fileExists = Files.exists(filePath);
+        if (fileExists) {
+            System.out.println("[ClientSession] 警告: 文件 " + filename + " 已存在，将被覆盖");
+        }
+        
+        // 6. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开二进制模式数据连接以接收 " + filename);
+        
+        // 7. 建立数据连接并接收文件
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 连接到客户端数据端口
+            dataConn.connect(dataAddress);
+            
+            // 打开文件输出流
+            try (OutputStream fileOutput = Files.newOutputStream(filePath, 
+                    StandardOpenOption.CREATE,           // 不存在则创建
+                    StandardOpenOption.TRUNCATE_EXISTING  // 存在则清空（覆盖）
+                )) {
+                
+                // 流式接收文件内容
+                long bytesReceived = dataConn.receiveToStream(fileOutput);
+                
+                System.out.println("[ClientSession] 文件 " + filename + " 接收完成: " + 
+                                 bytesReceived + " 字节");
+            }
+            
+        } catch (IOException e) {
+            // 数据连接失败或写入失败
+            System.err.println("[ClientSession] 文件上传失败: " + e.getMessage());
+            reply(426, "数据连接失败或写入失败: " + e.getMessage());
+            
+            // 删除不完整的文件（可选）
+            try {
+                if (Files.exists(filePath)) {
+                    Files.delete(filePath);
+                    System.out.println("[ClientSession] 已删除不完整的文件: " + filename);
+                }
+            } catch (IOException deleteEx) {
+                System.err.println("[ClientSession] 无法删除不完整的文件: " + deleteEx.getMessage());
+            }
+            
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            // 清空数据地址（要求下次使用前重新设置 PORT）
+            dataAddress = null;
+        }
+        
+        // 8. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 DELE 命令 - 删除文件
+     * 
+     * 命令格式：DELE <filename>
+     */
+    private void handleDele(String filename) throws IOException {
+        // 1. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "DELE 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 2. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(553, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 3. 检查文件是否存在
+        if (!Files.exists(filePath)) {
+            reply(550, "文件不存在: " + filename);
+            return;
+        }
+        
+        // 4. 检查是否为普通文件（不允许删除目录）
+        if (!Files.isRegularFile(filePath)) {
+            reply(550, filename + " 不是普通文件（不能删除目录）");
+            return;
+        }
+        
+        // 5. 尝试删除文件
+        try {
+            Files.delete(filePath);
+            System.out.println("[ClientSession] 文件已删除: " + filename);
+            reply(250, "文件 " + filename + " 已删除");
+        } catch (IOException e) {
+            // 删除失败（可能是文件被占用、权限不足）
+            System.err.println("[ClientSession] 删除文件失败: " + e.getMessage());
+            reply(450, "无法删除文件: " + e.getMessage());
+        }
     }
 
     
