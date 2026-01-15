@@ -50,6 +50,26 @@ public class DataConnection {
     }
     
     /**
+     * 接受客户端连接（被动模式）
+     * 
+     * @param serverSocket 服务器端监听的Socket
+     * @throws IOException 如果接受连接失败
+     */
+    public void acceptFrom(java.net.ServerSocket serverSocket) throws IOException {
+        System.out.println("[DataConnection] 等待客户端连接到被动模式端口: " + serverSocket.getLocalPort());
+        
+        // 等待客户端连接
+        dataSocket = serverSocket.accept();
+        dataSocket.setSoTimeout(TIMEOUT);
+        
+        // 获取输入输出流
+        inputStream = dataSocket.getInputStream();
+        outputStream = dataSocket.getOutputStream();
+        
+        System.out.println("[DataConnection] 客户端已连接到被动模式数据端口");
+    }
+    
+    /**
      * 发送文本数据（如目录列表）
      * 
      * @param text 要发送的文本内容

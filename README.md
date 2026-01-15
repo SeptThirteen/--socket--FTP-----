@@ -16,6 +16,7 @@
 - ✅ **文件下载** (RETR): 使用二进制流传输，8KB 缓冲
 - ✅ **文件上传** (STOR): 支持文件覆盖，错误恢复
 - ✅ **文件删除** (DELE): 仅允许删除常规文件
+- ✅ **目录创建** (MKD): 创建新目录，路径安全验证
 - ✅ **标准 FTP 响应码**: 150/226/425/501/550 等
 
 ### Day 7: 完善功能
@@ -49,7 +50,8 @@
 │  │  ├─ LIST           │
 │  │  ├─ RETR           │
 │  │  ├─ STOR           │
-│  │  └─ DELE           │
+│  │  ├─ DELE           │
+│  │  └─ MKD            │
 │  ├─ DataConnection    │
 │  ├─ PathValidator     │
 │  └─ UserStore        │
@@ -68,11 +70,11 @@
 | 组件 | 功能 | 主要方法 |
 |------|------|---------|
 | **FtpServer** | 服务器主程序，接受连接 | main(), run() |
-| **ClientSession** | 处理单个客户端会话 | handleCommand(), reply() |
+| **ClientSession** | 处理单个客户端会话 | handleCommand(), reply(), handleMkd() |
 | **DataConnection** | 管理数据连接和文件传输 | sendText(), sendFromStream(), receiveToStream() |
 | **PathValidator** | 验证文件路径安全性 | resolvePath(), normalize() |
 | **UserStore** | 管理用户账户和密码 | authenticate() |
-| **SimpleFtpClient** | 测试用客户端 | list(), retr(), stor(), dele() |
+| **SimpleFtpClient** | 测试用客户端 | list(), retr(), stor(), dele(), mkd() |
 
 ### 数据连接工作流程
 
@@ -129,6 +131,16 @@
   │<── 226 Transfer Complete ────┤
 ```
 
+#### MKD 命令流程（创建目录）
+```
+客户端                          服务器
+  │                              │
+  ├─── MKD dirname ─────────────>│ (创建目录)
+  │                              │
+  │<── 257 "dirname" created ────┤ (成功创建)
+  │                              │
+```
+
 ## 快速开始
 
 ### 环境要求
@@ -178,7 +190,7 @@ java -cp bin data.SimpleFtpClient
 基于socket 的FTP设计与实现/
 ├── src/
 │   ├── FtpServer.java           # 服务器主程序
-│   ├── ClientSession.java        # 客户端会话处理
+│   ├── ClientSession.java        # 客户端会话处理 (支持 MKD/DELE/RETR/STOR/LIST 等)
 │   ├── DataConnection.java       # 数据连接管理
 │   ├── PathValidator.java        # 路径验证
 │   ├── UserStore.java            # 用户管理
@@ -211,12 +223,13 @@ java -cp bin data.SimpleFtpClient
 ### 2xx 系列（成功）
 | 码 | 含义 |
 |----|------|
-| 200 | PORT 命令执行成功 |
+| 200 | 命令执行成功（PORT、TYPE 等） |
 | 220 | 服务器就绪 |
 | 226 | 传输完成 |
+| 227 | 进入被动模式 |
 | 230 | 用户已登录 |
-| 250 | 请求的文件操作成功 |
-| 257 | 文件名操作成功 |
+| 250 | 请求的文件操作成功（CWD、DELE 等） |
+| 257 | 文件名操作成功（PWD、MKD 等） |
 
 ### 3xx 系列（需要进一步操作）
 | 码 | 含义 |
@@ -331,29 +344,33 @@ Charset CONN_CHARSET = Charset.forName("UTF-8");
 ## 常见问题
 
 ### Q1: 为什么使用 PORT 而不是 PASV？
-**答**: PORT（主动模式）在实现上更简单直观，易于学习。生产环境通常使用 PASV（被动模式）。
+**答**: PORT（主动模式）在实现上更简单直观，易于学习。现在已支持 PASV（被动模式），兼容更多 FTP 客户端（如 Windows 资源管理器、MobaXterm）。
 
-### Q2: 支持目录上传/下载吗？
-**答**: 不支持。标准 FTP 中目录操作需要 MKD/RMD 命令，本项目简化为仅支持文件操作。
+### Q2: MKD 命令如何工作？
+**答**: MKD（Make Directory）命令在当前工作目录或指定路径下创建新目录。若目录已存在返回 550 错误，创建成功返回 257 响应。所有路径都通过 PathValidator 验证防止路径穿越。
 
-### Q3: 可以上传/下载符号链接吗？
+### Q3: 支持目录上传/下载吗？
+**答**: 不支持。标准 FTP 中目录操作需要 MKD/RMD 命令等，本项目简化为仅支持文件操作。可通过多个 MKD 命令递归创建目录结构。
+
+### Q4: 可以上传/下载符号链接吗？
 **答**: 不行。PathValidator 检查 `isRegularFile()`，符号链接被视为非常规文件。
 
-### Q4: 如何处理网络中断？
+### Q5: 如何处理网络中断？
 **答**: 客户端实现了 SocketTimeoutException 捕获。服务器在异常时自动断开连接并释放资源。
 
-### Q5: 支持断点续传吗？
+### Q6: 支持断点续传吗？
 **答**: 不支持。需要实现 REST 命令和文件偏移量管理，超出本项目范围。
 
 ## 扩展建议
 
 ### 级别 1: 初级
-- [ ] 实现 PASV（被动模式）命令
+- [x] 实现 PASV（被动模式）命令 ✅ 已完成
+- [x] 支持目录创建 (MKD) ✅ 已完成
 - [ ] 添加 HELP 命令完整帮助
-- [ ] 实现 TYPE 命令（ASCII/二进制切换）
+- [ ] 实现 RMD（删除目录）命令
 
 ### 级别 2: 中级
-- [ ] 支持目录创建 (MKD) 和删除 (RMD)
+- [ ] 支持目录删除 (RMD) 和递归删除
 - [ ] 实现 APPEND 命令（追加写入）
 - [ ] 添加文件修改时间查询 (MDTM)
 - [ ] 实现日志记录系统
@@ -381,4 +398,4 @@ Charset CONN_CHARSET = Charset.forName("UTF-8");
 
 ## 最后更新
 
-2026 年 1 月 14 日
+2026 年 1 月 14 日 - 添加 MKD（Make Directory）命令支持

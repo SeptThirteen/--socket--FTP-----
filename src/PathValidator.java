@@ -84,21 +84,32 @@ public class PathValidator {
         
         // 2. 处理用户输入路径，去掉字符串开头和结尾的空白字符
         userInputPath = userInputPath.trim();
+        
+        // 记录是否为绝对路径
+        boolean isAbsolute = userInputPath.startsWith("/");
+        
         // 如果用户输入以 / 开头，表示从根目录开始（绝对路径）
-        if (userInputPath.startsWith("/")) {
+        if (isAbsolute) {
             // 去掉前导 /，因为我们会基于 rootDirectory 解析
             userInputPath = userInputPath.substring(1);
         }
         
 
-        // 3. 解析用户路径（基于当前工作目录）
+        // 3. 解析用户路径
         Path targetPath;
         if (userInputPath.isEmpty() || userInputPath.equals(".")) {
             // 用户输入为空或 "."，表示当前目录
-            targetPath = currentDir;
+            if (isAbsolute) {
+                // 绝对路径指向根目录
+                targetPath = rootDirectory;
+            } else {
+                // 相对路径指向当前目录
+                targetPath = currentDir;
+            }
         } else {
-            // 将用户路径附加到当前目录
-            targetPath = currentDir.resolve(userInputPath);
+            // 根据是否为绝对路径选择基础目录
+            Path baseDir = isAbsolute ? rootDirectory : currentDir;
+            targetPath = baseDir.resolve(userInputPath);
         }
         
         // 4. 规范化路径（处理 . 和 ..）

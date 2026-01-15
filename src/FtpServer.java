@@ -18,8 +18,8 @@ import java.util.concurrent.Executors;
  */
 public class FtpServer {
     
-    /** FTP 虚拟根目录 */
-    private static final String FTP_ROOT_DIR = "data";
+    /** FTP 虚拟根目录 - 相对于项目根目录（上一级 bin 目录）*/
+    private static final String FTP_ROOT_DIR = "../data";
 
     /** FTP 控制端口 */
     private static final int CONTROL_PORT = 2121;
@@ -34,14 +34,21 @@ public class FtpServer {
         System.out.println("[FtpServer] FTP 服务器启动中...");
 
         // 1.创建根目录
-        Path rootPath = Paths.get(FTP_ROOT_DIR);
-        if (!Files.exists(rootPath) || !Files.isDirectory(rootPath)) {
-            System.err.println("[FtpServer] 错误：根目录不存在或不是目录: " + rootPath.toAbsolutePath());
-            System.err.println("[FtpServer] 请创建 data 目录并重新运行");
+        Path rootPath;
+        try {
+            rootPath = Paths.get(FTP_ROOT_DIR).toRealPath();
+        } catch (IOException e) {
+            System.err.println("[FtpServer] 错误：无法找到 data 目录");
+            System.err.println("[FtpServer] 请确保运行命令时在 bin 目录: cd bin && java data.FtpServer");
             return;
         }
         
-        System.out.println("[FtpServer] FTP 根目录: " + rootPath.toAbsolutePath());
+        if (!Files.isDirectory(rootPath)) {
+            System.err.println("[FtpServer] 错误：data 不是目录: " + rootPath);
+            return;
+        }
+        
+        System.out.println("[FtpServer] FTP 根目录: " + rootPath);
     
 
         // 2. 创建用户存储管理器

@@ -451,6 +451,28 @@ public class SimpleFtpClient {
             System.out.println("[客户端] ✗ 删除失败: " + response);
         }
     }
+
+    /**
+     * 创建目录
+     */
+    public void mkd(String remoteDir) throws IOException {
+        System.out.println("\n[MKD 创建目录命令]");
+        System.out.println("[客户端] 发送: MKD " + remoteDir);
+        
+        out.write("MKD " + remoteDir + "\r\n");
+        out.flush();
+        
+        String response = in.readLine();
+        System.out.println("[服务器] " + response);
+        
+        if (response.startsWith("257")) {
+            System.out.println("[客户端] ✓ 目录创建成功");
+        } else if (response.startsWith("550")) {
+            System.out.println("[客户端] ✗ 目录已存在或无法创建");
+        } else {
+            System.out.println("[客户端] ✗ 创建失败: " + response);
+        }
+    }
     
     /**
      * 断开连接
