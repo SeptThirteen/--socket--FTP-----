@@ -1,0 +1,1072 @@
+package data;
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.util.Locale;
+
+/**
+ * 客户端会话处理器
+ * 
+ * 每当一个客户端连接到 FTP 服务器时，就创建一个 ClientSession 实例
+ * 这个实例在一个单独的线程中运行，负责：
+ * 1. 与该客户端通过 Socket 进行通信
+ * 2. 读取客户端的 FTP 命令
+ * 3. 维护登录状态和其他会话数据
+ * 4. 发送响应码和消息给客户端
+ */
+public class ClientSession implements Runnable {
+
+    /**
+     * 会话读写使用的字符集。为兼容 Windows 自带 telnet（默认 GBK），可切换为 GBK。
+     * 如需改回 UTF-8，只需调整此处常量。
+     */
+    private static final Charset CONN_CHARSET = Charset.forName("UTF-8");
+    
+    // ==================== 成员变量 ====================
+    
+    /** 与客户端通信的 Socket */
+    private final Socket controlSocket;
+    
+    /** 从 Socket 读取数据的 Reader（一行一行地读） */
+    private final BufferedReader in;
+    
+    /** 向 Socket 写入数据的 Writer（一行一行地写） */
+    private final BufferedWriter out;
+    
+    /** 用户表管理器 */
+    private final UserStore userStore;
+    
+    /** 路径验证器 */
+    private final PathValidator pathValidator;
+
+    // ==================== 会话状态 ====================
+    
+    /** 是否已认证（已登录）*/
+    private boolean authenticated = false;
+    
+    /** 当前登录的用户名（未登录时为 null）*/
+    private String currentUser = null;
+    
+    /** 当前工作目录（相对于根目录的路径，如 "/" 或 "/upload"） */
+    private String currentWorkingDir = "/";
+    
+    /** 客户端数据端口地址（由 PORT 命令设置）*/
+    private InetSocketAddress dataAddress = null;
+    
+    /** 是否使用被动模式 */
+    private boolean passiveMode = false;
+    
+    /** 被动模式下的服务端数据端口 */
+    private java.net.ServerSocket passiveServerSocket = null;
+
+
+    // ==================== 构造方法 ====================
+    
+    /**
+     * 初始化一个会话
+     * 
+     * @param controlSocket 与客户端连接的 Socket
+     * @param rootPath FTP 虚拟根目录路径
+     * @param userStore 用户表管理器
+     * @throws IOException 如果 Socket 读写出错
+     */
+    public ClientSession(Socket controlSocket, String rootPath, UserStore userStore) throws IOException {
+        this.controlSocket = controlSocket;
+        this.userStore = userStore;
+        // 初始化路径验证器
+        this.pathValidator = new PathValidator(rootPath);
+        
+        // 初始化当前工作目录为根目录
+        this.currentWorkingDir = "/";
+            
+
+
+        // 从 Socket 获取输入流和输出流
+        // InputStreamReader 将字节流转换为字符流，因为 FTP 命令是文本协议，需要把字节流转换成字符流并用带缓冲的按行读写工具来正确、可靠且高效地处理命令和回复。
+        // BufferedReader 提供按行读取的便利
+        InputStream socketInput = controlSocket.getInputStream();
+        this.in = new BufferedReader(
+            new InputStreamReader(socketInput, CONN_CHARSET)
+        );
+        
+        // 同理，BufferedWriter 提供按行写的便利
+        OutputStream socketOutput = controlSocket.getOutputStream();
+        this.out = new BufferedWriter(
+            new OutputStreamWriter(socketOutput, CONN_CHARSET)
+        );
+    }
+    
+    // ==================== 核心方法 ====================
+    
+    /**
+     * 线程运行方法
+     * 当这个会话对象被提交给线程执行时，此方法会被调用
+     * 
+     * 整个生命周期：
+     * 1. 发送欢迎码 220
+     * 2. 循环读取客户端命令并处理
+     * 3. 处理 QUIT 时退出循环，关闭连接
+     */
+    @Override
+    public void run() {
+        try {
+            // 设置 Socket 超时时间（毫秒）：300 秒
+            // 如果 300 秒内没有收到数据，Socket 会抛出异常
+            controlSocket.setSoTimeout(300000);
+            
+            // 发送欢迎码
+            reply(220, "简易 FTP 服务器已准备好");
+            System.out.println("[ClientSession] 新连接：" + controlSocket.getInetAddress().getHostAddress());
+                
+            // 命令处理主循环,不断读取客户端命令并处理
+            String line;
+            while ((line = in.readLine()) != null) {
+                // 去掉首尾空白
+                line = line.trim();
+                
+                // 忽略空行
+                if (line.isEmpty()) {
+                    continue;
+                }
+                
+                // 处理这条命令
+                handleCommand(line);
+                
+                // 如果用户已经下达了 QUIT，则在下一个循环时 in.readLine() 会返回 null
+            }
+        } catch (IOException e) {
+            // 客户端连接关闭或网络错误
+            System.out.println("[ClientSession] 客户端" + currentUser + "断开连接: " + e.getMessage());
+        } finally {
+            // 确保连接被正确关闭
+            try {
+                controlSocket.close();
+            } catch (IOException e) {
+                // 忽略关闭时的错误
+            }
+        }
+    }
+    
+    /**
+     * 处理一条 FTP 命令
+     * 
+     * @param commandLine 整条命令（如 "USER alice"）
+     */
+    private void handleCommand(String commandLine) {
+        try {
+            // 按空格拆分：第一个词是命令，剩下的是参数
+            // split("\\s+", 2) 表示：按任意个空白分割，最多分 2 段
+            // 例如 "USER alice" → ["USER", "alice"]
+            // 例如 "STOR  file.txt" → ["STOR", "file.txt"]
+            String[] parts = commandLine.split("\\s+", 2);
+            String cmd = parts[0].toUpperCase(Locale.ROOT);  // 命令转大写，parts[0] 是命令
+            String arg = (parts.length > 1) ? parts[1] : "";  // 获取参数，若无则空字符串
+            
+            // 根据命令类型进行分发处理，核心命令处理函数，这个实现逻辑然后调用具体的处理函数
+            switch (cmd) {
+                case "USER":
+                    handleUser(arg);
+                    break;
+                case "PASS":
+                    handlePass(arg);
+                    break;
+                case "QUIT":
+                    handleQuit();
+                    break;
+                case "EXIT":
+                    handleQuit();
+                    break;
+                case "HELP":
+                    handleHelp();
+                    break;
+                case "CWD":
+                    handleCwd(arg);
+                    break;
+                case "CDUP":
+                    handleCdup();
+                    break;
+                case "PWD":
+                    handlePwd();
+                    break;
+                case "CDUP":
+                    handleCdup();
+                    break;
+                case "PORT":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handlePort(arg);
+                    }
+                    break;
+                
+                case "PASV":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handlePasv();
+                    }
+                    break;
+                
+                case "LIST":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleList();
+                    }
+                    break;
+                case "RETR":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleRetr(arg);
+                    }
+                    break;
+                case "STOR":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleStor(arg);
+                    }
+                    break;
+                case "DELE":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleDele(arg);
+                    }
+                    break;
+                case "MKD":
+                    if (!authenticated) {
+                        reply(530, "请先登录");
+                    } else {
+                        handleMkd(arg);
+                    }
+                    break;
+                case "FEAT":
+                    handleFeat();
+                    break;
+                case "TYPE":
+                    // TYPE 命令：设置传输模式（ASCII/BINARY）
+                    // 我们统一使用二进制，但需要响应此命令以兼容 Windows 资源管理器
+                    handleType(arg);
+                    break;
+                case "OPTS":
+                    // OPTS 命令：FTP 扩展选项
+                    // 返回 502 或 200 均可，这里返回 200 表示接受但不处理
+                    reply(200, "命令接受");
+                    break;
+                case "SYST":
+                    // SYST 命令：查询系统类型
+                    reply(215, "WINDOWS");
+                    break;
+                case "NOOP":
+                    // NOOP 命令：空操作（心跳）
+                    reply(200, "NOOP 命令");
+                    break;
+                default:
+                    // 未知命令
+                    reply(502, "不支持的命令: " + cmd);
+            }
+        } catch (Exception e) {
+            // 命令处理中出错，发送错误响应
+            try {
+                reply(500, "服务器错误: " + e.getMessage());
+            } catch (IOException ignored) {
+                // 如果发送错误信息也失败了，放弃
+            }
+        }
+    }
+    
+    // ==================== 命令处理函数 ====================
+    /**
+     * 处理 USER 命令
+     * 客户端要求：USER <username>
+     * 服务器响应：
+     *   - 用户存在 → 331（需要密码）
+     *   - 用户不存在 → 530（登录失败）
+     */
+    private void handleUser(String username) throws IOException {
+        // 1. 参数校验
+        //sername.trim().isEmpty()把用户名前后空格去掉后，检查是否为空字符串
+        if (username == null || username.trim().isEmpty()) {
+            reply(501, "USER 命令需要一个参数");
+            return;
+        }
+        //去掉前后空格的用户名
+        username = username.trim();
+        
+        // 2. 在存储中检查用户是否存在
+        if (!userStore.userExists(username)) {
+            reply(530, "无效的用户");
+            return;
+        }
+        
+        // 3. 用户存在，记录下来，等待 PASS 命令
+        currentUser = username;
+        authenticated = false;  // 还未通过密码认证
+        reply(331, "用户名正确，需要密码");
+    }
+    
+
+    /**
+     * 处理 PASS 命令
+     * 客户端要求：PASS <password>
+     * 服务器响应：
+     *   - 认证成功 → 230（已登录）
+     *   - 认证失败或未先发送 USER → 530（登录失败）
+     */
+    private void handlePass(String password) throws IOException {
+        // 1. 参数校验
+        if (password == null || password.trim().isEmpty()) {
+            reply(501, "PASS 命令需要一个参数");
+            return;
+        }
+        
+        password = password.trim();
+        
+        // 2. 检查是否已经接收到 USER 命令
+        if (currentUser == null) {
+            reply(503, "请先使用 USER 命令登录");
+            return;
+        }
+        
+        // 3. 校验密码
+        if (userStore.authenticate(currentUser, password)) {
+            // 密码正确，认证成功
+            authenticated = true;
+            reply(230, "用户 " + currentUser + " 已登录");
+        } else {
+            // 密码错误
+            currentUser = null;
+            authenticated = false;
+            reply(530, "登录失败");
+        }
+    }
+    
+    /**
+     * 处理 QUIT 命令
+     * 客户端要求：QUIT
+     * 服务器响应：221（再见），然后关闭连接
+     */
+    private void handleQuit() throws IOException {
+        reply(221, "再见");
+        // 关闭连接，主循环中 readLine() 会返回 null，自动退出
+        controlSocket.close();
+    }
+
+    /**
+     * 处理 CWD 命令
+     * 客户端要求：CWD <目录>
+     * 服务器响应：
+     *   - 成功 → 250（目录已更改）
+     *   - 失败 → 550（目录不可用）
+     */
+    private void handleCwd(String dir) throws IOException {
+        if (!authenticated) {
+            reply(530, "请先登录");
+            return;
+        }
+        
+        if (dir == null || dir.trim().isEmpty()) {
+            reply(501, "CWD 命令需要一个参数");
+            return;
+        }
+        
+        dir = dir.trim();
+        
+        try {
+            //* 获取当前目录的绝对路径 */
+            Path newPath = pathValidator.resolvePath(currentWorkingDir, dir);
+            System.out.println("[ClientSession] CWD 目标路径: " + newPath);
+            System.out.println("[ClientSession] 路径存在: " + java.nio.file.Files.exists(newPath));
+            System.out.println("[ClientSession] 是目录: " + java.nio.file.Files.isDirectory(newPath));
+            
+            //* 验证该路径是否为有效目录 */
+            if (pathValidator.isValidDirectory(newPath)) {
+                // 更新当前工作目录（相对于根目录的路径）
+                currentWorkingDir = pathValidator.toVirtualPath(newPath);
+                reply(250, "目录已更改到 " + currentWorkingDir);
+            } else {
+                System.err.println("[ClientSession] 目录验证失败: " + newPath);
+                reply(550, "目录不可用");
+            }
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝");
+        } catch (IOException e) {
+            reply(550, "目录不可用");
+        }
+    }
+    
+    /**
+     * 处理 CDUP 命令
+     * 客户端要求：CDUP
+     * 服务器响应：250 或 550
+     * 功能：进入父目录（等同于 CWD ..）
+     */
+    private void handleCdup() throws IOException {
+        if (!authenticated) {
+            reply(530, "请先登录");
+            return;
+        }
+        
+        // CDUP 等同于 CWD ..
+        handleCwd("..");
+    }
+
+    /**
+     * 处理 FEAT 命令
+     * 返回服务器支持的扩展特性列表（最少返回 End 标记）
+     */
+    private void handleFeat() throws IOException {
+        // FEAT 响应格式：
+        // 211-Features
+        //  FEAT1
+        //  FEAT2
+        // 211 End
+        out.write("211-Features\r\n");
+        out.write(" UTF8\r\n");
+        out.write(" SIZE\r\n");
+        out.write(" MDTM\r\n");
+        out.write(" MLST\r\n");
+        out.write("211 End\r\n");
+        out.flush();
+    }
+
+    /**
+     * 处理 PWD 命令
+     * 客户端要求：PWD
+     * 服务器响应：257 "<当前目录>"
+     */
+    private void handlePwd() throws IOException {
+        if (!authenticated) {
+            reply(530, "请先登录");
+            return;
+        }
+        
+        reply(257, "\"" + currentWorkingDir + "\" 是当前目录");
+    }    
+
+
+
+    /**
+     * 处理 HELP 命令（可选）
+     * 显示支持的命令列表
+     */
+    private void handleHelp() throws IOException {
+        reply(214, "支持的命令:");
+        out.write("  user <用户名>  - 使用用户名登录\r\n");
+        out.write("  pass <密码>  - 提供密码\r\n");
+        out.write("  port h1,h2,h3,h4,p1,p2 - 设置数据端口\r\n");
+        out.write("  list - 列出目录内容\r\n");
+        out.write("  retr <文件名> - 下载文件\r\n");
+        out.write("  stor <文件名> - 上传文件\r\n");
+        out.write("  dele <文件名> - 删除文件\r\n");
+        out.write("  quit - 断开连接\r\n");
+        out.write("  cwd <目录>  - 更改当前目录\r\n");
+        out.write("  pwd - 显示当前目录\r\n");
+        out.write("  help - 显示此消息\r\n");
+        out.flush();
+    }
+
+    /**
+     * 处理 TYPE 命令 - 设置传输模式
+     * 
+     * 命令格式：TYPE A (ASCII) 或 TYPE I (Binary)
+     * 本服务器统一使用二进制模式，但需要接受此命令以兼容 Windows 资源管理器
+     */
+    private void handleType(String mode) throws IOException {
+        if (mode == null || mode.trim().isEmpty()) {
+            reply(501, "TYPE 命令需要参数（A 或 I）");
+            return;
+        }
+        
+        mode = mode.trim().toUpperCase();
+        
+        if ("A".equals(mode)) {
+            // ASCII 模式
+            reply(200, "设置为 ASCII 模式");
+        } else if ("I".equals(mode)) {
+            // Binary 模式
+            reply(200, "设置为二进制模式");
+        } else {
+            reply(501, "TYPE 命令参数错误，应为 A 或 I");
+        }
+    }
+    
+    /**
+     * 处理 PORT 命令 - 设置客户端数据端口
+     * 
+     * 命令格式：PORT h1,h2,h3,h4,p1,p2
+     * 
+     * @param arg 格式为 "h1,h2,h3,h4,p1,p2" 的字符串
+     */
+    private void handlePort(String arg) throws IOException {
+        // 1. 参数校验
+        if (arg == null || arg.trim().isEmpty()) {
+            reply(501, "PORT 命令需要参数");
+            return;
+        }
+        
+        arg = arg.trim();
+        
+        try {
+            // 2. 解析参数
+            String[] parts = arg.split(",");
+            
+            if (parts.length != 6) {
+                reply(501, "PORT 命令格式: h1,h2,h3,h4,p1,p2");
+                return;
+            }
+            
+            // 3. 组装 IP 地址
+            String ip = parts[0] + "." + parts[1] + "." + parts[2] + "." + parts[3];
+            
+            // 4. 计算端口：port = p1 * 256 + p2
+            int p1 = Integer.parseInt(parts[4]);
+            int p2 = Integer.parseInt(parts[5]);
+            int port = p1 * 256 + p2;
+            
+            // 5. 端口范围校验
+            if (port < 1024 || port > 65535) {
+                reply(501, "无效的端口号: " + port);
+                return;
+            }
+            
+            // 6. 保存数据端口地址
+            dataAddress = new InetSocketAddress(ip, port);
+            
+            System.out.println("[ClientSession] 客户端数据端口设置为: " + dataAddress);
+            reply(200, "PORT 命令执行成功");
+            
+        } catch (NumberFormatException e) {
+            reply(501, "PORT 命令参数无效: " + e.getMessage());
+        } catch (Exception e) {
+            reply(501, "PORT 命令执行失败: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * 处理 PASV 命令 - 进入被动模式
+     * 
+     * 被动模式：服务器监听一个端口，等待客户端连接
+     * 响应格式：227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+     */
+    private void handlePasv() throws IOException {
+        try {
+            // 1. 关闭之前的被动模式ServerSocket（如果有）
+            if (passiveServerSocket != null && !passiveServerSocket.isClosed()) {
+                passiveServerSocket.close();
+            }
+            
+            // 2. 创建新的ServerSocket，端口由系统自动分配（端口0）
+            passiveServerSocket = new java.net.ServerSocket(0);
+            passiveServerSocket.setSoTimeout(300000);  // 300秒（5分钟）超时，支持大文件传输
+            
+            // 3. 获取服务器IP地址（从控制连接获取）
+            String serverIp = controlSocket.getLocalAddress().getHostAddress();
+            int port = passiveServerSocket.getLocalPort();
+            
+            // 4. 计算 p1 和 p2：port = p1 * 256 + p2
+            int p1 = port / 256;
+            int p2 = port % 256;
+            
+            // 5. 格式化IP地址（用逗号替换点号）
+            String[] ipParts = serverIp.split("\\.");
+            String response = String.format("(%s,%s,%s,%s,%d,%d).",
+                ipParts[0], ipParts[1], ipParts[2], ipParts[3], p1, p2);
+            
+            // 6. 设置为被动模式
+            passiveMode = true;
+            dataAddress = null;  // 清空PORT模式的地址
+            
+            System.out.println("[ClientSession] 进入被动模式，监听端口: " + port);
+            reply(227, "Entering Passive Mode " + response);
+            
+        } catch (IOException e) {
+            passiveMode = false;
+            reply(425, "无法打开被动模式: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * 处理 LIST 命令 - 列出当前目录内容
+     * 
+     * 工作流程：
+     * 1. 检查是否已设置数据端口（PORT 命令或 PASV 命令）
+     * 2. 发送 150 响应（即将打开数据连接）
+     * 3. 建立数据连接
+     * 4. 读取当前目录的文件列表
+     * 5. 通过数据连接发送列表
+     * 6. 关闭数据连接
+     * 7. 发送 226 响应（传输完成）
+     */
+    private void handleList() throws IOException {
+        System.out.println("[ClientSession] handleList 被调用，passiveMode=" + passiveMode + ", dataAddress=" + dataAddress);
+        
+        // 1. 检查是否已设置数据端口或被动模式
+        if (!passiveMode && dataAddress == null) {
+            reply(425, "请先使用 PORT 或 PASV 命令");
+            return;
+        }
+        
+        // 2. 解析当前工作目录对应的实际路径
+        Path currentDir;
+        try {
+            currentDir = pathValidator.resolvePath(currentWorkingDir, ".");
+            System.out.println("[ClientSession] 当前目录解析为: " + currentDir);
+        } catch (Exception e) {
+            System.err.println("[ClientSession] 目录解析失败: " + e.getMessage());
+            reply(550, "无法访问目录: " + e.getMessage());
+            return;
+        }
+        
+        // 3. 检查目录是否存在
+        if (!Files.exists(currentDir) || !Files.isDirectory(currentDir)) {
+            reply(550, "目录不存在");
+            return;
+        }
+        
+        // 4. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开 ASCII 模式数据连接以获取文件列表");
+        
+        // 5. 建立数据连接并传输目录列表
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 根据模式连接数据端口
+            if (passiveMode) {
+                // 被动模式：等待客户端连接
+                dataConn.acceptFrom(passiveServerSocket);
+            } else {
+                // 主动模式：连接到客户端数据端口
+                dataConn.connect(dataAddress);
+            }
+            
+            // 构建目录列表文本（Unix ls -l 格式）
+            StringBuilder listBuilder = new StringBuilder();
+            
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(currentDir)) {
+                for (Path entry : stream) {
+                    // 获取文件名
+                    String filename = entry.getFileName().toString();
+                    
+                    // 判断是否为目录
+                    boolean isDirectory = Files.isDirectory(entry);
+                    
+                    // 获取文件大小
+                    long size = isDirectory ? 0 : Files.size(entry);
+                    
+                    // 获取修改时间
+                    BasicFileAttributes attrs = Files.readAttributes(entry, BasicFileAttributes.class);
+                    FileTime lastModified = attrs.lastModifiedTime();
+                    
+                    // 格式化时间为 "Jan 14 16:00" 格式
+                    java.time.LocalDateTime dateTime = java.time.LocalDateTime.ofInstant(
+                        lastModified.toInstant(), 
+                        java.time.ZoneId.systemDefault()
+                    );
+                    String timeStr = String.format("%s %2d %02d:%02d",
+                        new String[]{"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}[dateTime.getMonthValue() - 1],
+                        dateTime.getDayOfMonth(),
+                        dateTime.getHour(),
+                        dateTime.getMinute()
+                    );
+                    
+                    // 构建 Unix ls -l 格式的行
+                    // 格式: drwxr-xr-x 1 owner group size month day time filename
+                    String permissions = isDirectory ? "drwxr-xr-x" : "-rw-r--r--";
+                    String line = String.format("%s %3d %-8s %-8s %8d %s %s\r\n",
+                        permissions,
+                        1,                    // 链接数
+                        "owner",              // 所有者
+                        "group",              // 组
+                        size,                 // 文件大小
+                        timeStr,              // 修改时间
+                        filename              // 文件名
+                    );
+                    
+                    listBuilder.append(line);
+                }
+            }
+            
+            // 发送列表数据
+            String listText = listBuilder.toString();
+            dataConn.sendText(listText);
+            
+            System.out.println("[ClientSession] 已发送目录列表，共 " + listText.length() + " 字节");
+            
+        } catch (IOException e) {
+            // 数据连接失败
+            reply(426, "数据连接失败: " + e.getMessage());
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            
+            // 清理数据连接状态
+            if (passiveMode && passiveServerSocket != null) {
+                try {
+                    passiveServerSocket.close();
+                } catch (IOException ignored) {}
+                passiveServerSocket = null;
+                passiveMode = false;
+            }
+            dataAddress = null;
+        }
+        
+        // 6. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 RETR 命令 - 下载文件
+     * 
+     * 命令格式：RETR <filename>
+     */
+    private void handleRetr(String filename) throws IOException {
+        // 1. 检查是否已设置数据端口或被动模式
+        if (!passiveMode && dataAddress == null) {
+            reply(425, "请先使用 PORT 或 PASV 命令");
+            return;
+        }
+        
+        // 2. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "RETR 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 3. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(550, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 4. 检查文件是否存在
+        if (!Files.exists(filePath)) {
+            reply(550, "文件不存在: " + filename);
+            return;
+        }
+        
+        // 5. 检查是否为普通文件（不是目录）
+        if (!Files.isRegularFile(filePath)) {
+            reply(550, filename + " 不是普通文件");
+            return;
+        }
+        
+        // 6. 检查文件是否可读
+        if (!Files.isReadable(filePath)) {
+            reply(550, "文件不可读: " + filename);
+            return;
+        }
+        
+        // 7. 获取文件大小（用于日志）
+        long fileSize = Files.size(filePath);
+        
+        // 8. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开二进制模式数据连接以传输 " + filename + " (" + fileSize + " 字节)");
+        
+        // 9. 建立数据连接并传输文件
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 根据模式连接数据端口
+            if (passiveMode) {
+                dataConn.acceptFrom(passiveServerSocket);
+            } else {
+                dataConn.connect(dataAddress);
+            }
+            
+            // 打开文件输入流
+            try (InputStream fileInput = Files.newInputStream(filePath)) {
+                // 流式传输文件内容
+                long bytesTransferred = dataConn.sendFromStream(fileInput);
+                
+                System.out.println("[ClientSession] 文件 " + filename + " 传输完成: " + 
+                                 bytesTransferred + " 字节");
+            }
+            
+        } catch (IOException e) {
+            // 数据连接失败
+            reply(426, "数据连接失败: " + e.getMessage());
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            
+            // 清理数据连接状态
+            if (passiveMode && passiveServerSocket != null) {
+                try {
+                    passiveServerSocket.close();
+                } catch (IOException ignored) {}
+                passiveServerSocket = null;
+                passiveMode = false;
+            }
+            dataAddress = null;
+        }
+        
+        // 10. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 STOR 命令 - 上传文件
+     * 
+     * 命令格式：STOR <filename>
+     */
+    private void handleStor(String filename) throws IOException {
+        // 1. 检查是否已设置数据端口或被动模式
+        if (!passiveMode && dataAddress == null) {
+            reply(425, "请先使用 PORT 或 PASV 命令");
+            return;
+        }
+        
+        // 2. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "STOR 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 3. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(550, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 4. 检查父目录是否存在且可写
+        Path parentDir = filePath.getParent();
+        if (parentDir == null) {
+            reply(550, "无法确定父目录");
+            return;
+        }
+        
+        if (!Files.exists(parentDir)) {
+            reply(550, "目标目录不存在");
+            return;
+        }
+        
+        if (!Files.isDirectory(parentDir)) {
+            reply(550, "父路径不是目录");
+            return;
+        }
+        
+        if (!Files.isWritable(parentDir)) {
+            reply(550, "目标目录不可写");
+            return;
+        }
+        
+        // 5. 检查文件是否已存在（覆盖策略：直接覆盖）
+        boolean fileExists = Files.exists(filePath);
+        if (fileExists) {
+            System.out.println("[ClientSession] 警告: 文件 " + filename + " 已存在，将被覆盖");
+        }
+        
+        // 6. 发送"即将打开数据连接"的响应
+        reply(150, "正在打开二进制模式数据连接以接收 " + filename);
+        
+        // 7. 建立数据连接并接收文件
+        DataConnection dataConn = new DataConnection();
+        try {
+            // 根据模式连接数据端口
+            if (passiveMode) {
+                dataConn.acceptFrom(passiveServerSocket);
+            } else {
+                dataConn.connect(dataAddress);
+            }
+            
+            // 打开文件输出流
+            System.out.println("[ClientSession] 准备写入文件: " + filePath);
+            System.out.println("[ClientSession] 父目录可写: " + Files.isWritable(parentDir));
+            
+            try (OutputStream fileOutput = Files.newOutputStream(filePath, 
+                    StandardOpenOption.CREATE,           // 不存在则创建
+                    StandardOpenOption.TRUNCATE_EXISTING  // 存在则清空（覆盖）
+                )) {
+                
+                System.out.println("[ClientSession] 文件输出流已创建，开始接收数据...");
+                
+                // 流式接收文件内容
+                long bytesReceived = dataConn.receiveToStream(fileOutput);
+                
+                System.out.println("[ClientSession] 文件 " + filename + " 接收完成: " + 
+                                 bytesReceived + " 字节");
+            }
+            
+        } catch (IOException e) {
+            // 数据连接失败或写入失败
+            System.err.println("[ClientSession] 文件上传失败: " + e.getClass().getName() + " - " + e.getMessage());
+            e.printStackTrace();  // 打印完整的堆栈跟踪以便调试
+            reply(426, "数据连接失败或写入失败: " + e.getMessage());
+            
+            // 删除不完整的文件（可选）
+            try {
+                if (Files.exists(filePath)) {
+                    Files.delete(filePath);
+                    System.out.println("[ClientSession] 已删除不完整的文件: " + filename);
+                }
+            } catch (IOException deleteEx) {
+                System.err.println("[ClientSession] 无法删除不完整的文件: " + deleteEx.getMessage());
+            }
+            
+            return;
+        } finally {
+            // 无论成功与否，都要关闭数据连接
+            dataConn.close();
+            
+            // 清理数据连接状态
+            if (passiveMode && passiveServerSocket != null) {
+                try {
+                    passiveServerSocket.close();
+                } catch (IOException ignored) {}
+                passiveServerSocket = null;
+                passiveMode = false;
+            }
+            dataAddress = null;
+        }
+        
+        // 8. 发送传输完成响应
+        reply(226, "传输完成");
+    }
+
+    /**
+     * 处理 DELE 命令 - 删除文件
+     * 
+     * 命令格式：DELE <filename>
+     */
+    private void handleDele(String filename) throws IOException {
+        // 1. 参数校验
+        if (filename == null || filename.trim().isEmpty()) {
+            reply(501, "DELE 命令需要参数");
+            return;
+        }
+        
+        filename = filename.trim();
+        
+        // 2. 解析文件路径（相对于当前工作目录）
+        Path filePath;
+        try {
+            filePath = pathValidator.resolvePath(currentWorkingDir, filename);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(553, "无效的文件路径: " + e.getMessage());
+            return;
+        }
+        
+        // 3. 检查文件是否存在
+        if (!Files.exists(filePath)) {
+            reply(550, "文件不存在: " + filename);
+            return;
+        }
+        
+        // 4. 检查是否为普通文件（不允许删除目录）
+        if (!Files.isRegularFile(filePath)) {
+            reply(550, filename + " 不是普通文件（不能删除目录）");
+            return;
+        }
+        
+        // 5. 尝试删除文件
+        try {
+            Files.delete(filePath);
+            System.out.println("[ClientSession] 文件已删除: " + filename);
+            reply(250, "文件 " + filename + " 已删除");
+        } catch (IOException e) {
+            // 删除失败（可能是文件被占用、权限不足）
+            System.err.println("[ClientSession] 删除文件失败: " + e.getMessage());
+            reply(450, "无法删除文件: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 处理 MKD 命令 - 创建目录
+     * 
+     * @param dirname 要创建的目录名（相对于当前工作目录）
+     */
+    private void handleMkd(String dirname) throws IOException {
+        // 1. 参数校验
+        if (dirname == null || dirname.trim().isEmpty()) {
+            reply(501, "MKD 命令需要参数");
+            return;
+        }
+        
+        dirname = dirname.trim();
+        
+        // 2. 解析目录路径（相对于当前工作目录）
+        Path dirPath;
+        try {
+            dirPath = pathValidator.resolvePath(currentWorkingDir, dirname);
+        } catch (SecurityException e) {
+            reply(550, "访问被拒绝: " + e.getMessage());
+            return;
+        } catch (IOException e) {
+            reply(553, "无效的目录路径: " + e.getMessage());
+            return;
+        }
+        
+        // 3. 检查目录是否已存在
+        if (Files.exists(dirPath)) {
+            if (Files.isDirectory(dirPath)) {
+                reply(550, "目录已存在: " + dirname);
+            } else {
+                reply(550, dirname + " 已存在但不是目录");
+            }
+            return;
+        }
+        
+        // 4. 尝试创建目录
+        try {
+            Files.createDirectory(dirPath);
+            System.out.println("[ClientSession] 目录已创建: " + dirname);
+            // 返回创建成功的响应，格式为 257 "<pathname>" created
+            reply(257, "\"" + dirname + "\" 创建成功");
+        } catch (IOException e) {
+            // 创建失败（可能是权限不足、磁盘满等）
+            System.err.println("[ClientSession] 创建目录失败: " + e.getMessage());
+            reply(550, "无法创建目录: " + e.getMessage());
+        }
+    }
+
+    
+    // ==================== 工具方法 ====================
+    /**
+     * 向客户端发送 FTP 响应
+     * FTP 响应格式：<code> <message>\r\n
+     * 例如：220 Simple FTP Server Ready\r\n
+     * 
+     * @param code FTP 响应码（3 位数）
+     * @param message 响应消息
+     */
+    private void reply(int code, String message) throws IOException {
+        // 格式化响应：码 + 空格 + 消息 + 换行符
+        String response = code + " " + message + "\r\n";
+        out.write(response);
+        out.flush();// 刷新缓冲区
+        
+        // 可选：打印到服务器日志，便于调试
+        System.out.println("[ClientSession] " + currentUser + " <- " + response.trim());
+    }
+}
